@@ -87,3 +87,5 @@ data
 
 # vim
 *.swp
+
+segmentation_ckp

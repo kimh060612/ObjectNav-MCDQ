@@ -165,3 +165,21 @@ class PPO(nn.Module):
 
     def after_step(self):
         pass
+
+
+class DQNTrainer(nn.Module):
+    def __init__(self):
+        super(DQNTrainer, self).__init__()
+
+        
+        
+    def forward(self, *x):
+        raise NotImplementedError
+    
+    def update(self, rollouts):
+        pass
+    
+    def before_step(self):
+        nn.utils.clip_grad_norm_(
+            self.actor_critic.parameters(), self.max_grad_norm
+        )

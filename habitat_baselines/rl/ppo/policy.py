@@ -13,6 +13,7 @@ from habitat_baselines.common.utils import CategoricalNet, Flatten
 from habitat_baselines.rl.models.rnn_state_encoder import RNNStateEncoder
 from habitat_baselines.rl.models.simple_cnn import SimpleCNN
 
+from habitat_baselines.rl.models.mcd_qnet import QNet512, QNet, Q_discrete
 
 class Policy(nn.Module):
     def __init__(self, net, dim_actions):
@@ -100,6 +101,23 @@ class PointNavBaselinePolicy(Policy):
             action_space.n,
         )
 
+class UncertainGoalPolicy(Policy):
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        goal_sensor_uuid,
+        hidden_size=512,
+    ):
+        super().__init__(
+            UncertainGoalPolicyNet(
+                observation_space=observation_space,
+                hidden_size=hidden_size,
+                goal_sensor_uuid=goal_sensor_uuid,
+            ),
+            action_space.n,
+        )
+
 
 class Net(nn.Module, metaclass=abc.ABCMeta):
     @abc.abstractmethod
@@ -171,3 +189,95 @@ class PointNavBaselineNet(Net):
         x, rnn_hidden_states = self.state_encoder(x, rnn_hidden_states, masks)
 
         return x, rnn_hidden_states
+
+
+class UncertainGoalPolicyNet(Net):
+    r"""Network which passes the input image through CNN and concatenates
+    goal vector with CNN's output and passes that through RNN.
+    """
+
+    def __init__(self, 
+            observation_space, 
+            hidden_size, 
+            goal_sensor_uuid,
+            num_local_steps,
+            num_mc_drop,
+            mc_drop_rate,
+            device,
+            num_classes
+        ):
+        super().__init__()
+        self.num_mc_drop = num_mc_drop
+        self.mc_drop_rate = mc_drop_rate
+        self.num_local_steps = num_local_steps
+        
+        self.goal_sensor_uuid = goal_sensor_uuid
+        self._n_input_goal = observation_space.spaces[self.goal_sensor_uuid].shape[0]
+        self._hidden_size = hidden_size
+        self.device = device
+
+        self.Q_net = QNet(num_classes, True, 4, True, self.mc_drop_rate)
+        
+        self.state_encoder = RNNStateEncoder(
+            (0 if self.is_blind else self._hidden_size) + self._n_input_goal,
+            self._hidden_size,
+        )
+
+        ## (TODO): Things to consider
+        ## 1. How much the map covers? ==> 40m coverage for now
+        ## 2. Using whole global map or local map? => Local goal prediction or Global goal prediction
+        
+        ## Things to implement
+        ## 1. RGB Segmentation model (MobileNetv3-small) 
+        ##      -> Implemented in Trainer, Not in the policy network to reduce GPU utilization.
+        ## 2. Ground projection for Semantic & Occupancy Map
+        #### 2-1. (TODO) Auxiliary Task for map anticipation 
+        #### 2-2. (TODO) Occupancy reward for navigation
+        ## 3. MC-Dropout Policy => output is heatmap where goal is likely to be.
+        ## 4. Rollout Storage for off-policy PPO or Q learning
+        ## 5. Off-policy learning algorithm
+        
+        ## 9/27 결정 사항
+        ## PPO 버림. Bayesian DQN으로 방향 전환.
+        ## Bayesian DQN으로 바꾸는건 나중에. 현재는 MC dropout을 통하여 
+        
+        self.train()
+
+    @property
+    def output_size(self):
+        return self._hidden_size
+
+    @property
+    def is_blind(self):
+        return self.visual_encoder.is_blind
+
+    @property
+    def num_recurrent_layers(self):
+        return self.state_encoder.num_recurrent_layers
+
+    def get_target_encoding(self, observations):
+        return observations[self.goal_sensor_uuid]
+
+    def get_action_sets_from_Q(self, q_map):
+        pass
+
+    def forward(self, observations, global_allocentric_map, global_semantic_map):
+        target_obj_id = self.get_target_encoding(observations)
+        print(target_obj_id)
+        
+        global_goal_index = torch.zeros_like(global_allocentric_map).to(self.device)
+        global_goal_index[global_semantic_map == target_obj_id] = 1.
+        global_map_final = torch.cat([
+            global_allocentric_map.unsqueeze(1),
+            global_semantic_map.permute(0, 3, 1, 2),
+            global_goal_index.permute(0, 3, 1, 2)
+        ], dim=1)
+        
+        q_map_list = []
+        for _ in range(self.num_mc_drop):
+            q_map_list.append(self.Q_net(global_map_final))
+        q_map_stack = torch.stack(q_map_list, dim=1)
+        q_map_mean = torch.mean(q_map_stack, dim=1)
+        q_map_var = torch.var(q_map_stack, dim=1)
+        
+        return q_map_mean
