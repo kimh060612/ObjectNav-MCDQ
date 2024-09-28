@@ -39,13 +39,20 @@ class BasicBlock(nn.Module):
 
 class QNet(nn.Module):
 
-    def __init__(self, num_channel, is_occ, num_actions, is_goal, drop_rate, layers=[2, 2, 2, 2]):
+    def __init__(
+            self, 
+            num_channel, 
+            is_occ, num_actions, 
+            is_goal, drop_rate, is_target=False,
+            layers=[2, 2, 2, 2]
+        ):
         super(QNet, self).__init__()
         
         self.conf = is_occ
         self.num_channel = num_channel
         self.is_goal = is_goal
-        self.drop_rate = drop_rate
+        self.drop_rate = drop_rate if not is_target else 0.0 # target은 drop을 안 시킴.
+        self.is_target = is_target
 
         block = BasicBlock
         self.inplanes = 64
@@ -56,6 +63,10 @@ class QNet(nn.Module):
         )
         self.relu = nn.LeakyReLU(inplace=True)
 
+        
+        ### TODO: Re-consider the network architecture
+        ### 1. Not the Simple CNN, U-Net Like
+        ### 2. Get advice of professor!!!!!!!!!!!!!!!!!!!!!!!
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0], stride=1)
         self.drop_1 = nn.Dropout(p=self.drop_rate) # MC Dropout 
@@ -67,13 +78,23 @@ class QNet(nn.Module):
         self.drop_4 = nn.Dropout(p=self.drop_rate) # MC Dropout 
 
         self.conv2 = nn.Conv2d(512, 128, kernel_size=1, stride=1)
-        self.conv3 = nn.Conv2d(128, 32, kernel_size=1, stride=1)
-        self.conv4 = nn.Conv2d(32, num_actions, kernel_size=1, stride=1)
 
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(128, num_actions)
+
+        if not is_target:
+            self._init_weights(nn.init.kaiming_normal_)
+        else:
+            self._init_weights(nn.init.zeros_, is_zero=True)
+
+    def _init_weights(self, init_func, is_zero=False):
+        kwargs = { "mode": "fan_out", "nonlinearity": "relu" } if not is_zero else {}
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
+                init_func(m.weight, **kwargs)
+            if isinstance(m, nn.Linear):
+                init_func(m.weight, **kwargs)
+        
     def _make_layer(self, block, planes, blocks, stride=1):
         downsample = None
 
@@ -116,15 +137,11 @@ class QNet(nn.Module):
 
         x = self.conv2(x)
         x = self.relu(x)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear',
-                align_corners=True)
-        x = self.conv3(x)
-        x = self.relu(x)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear',
-                align_corners=True)
-        x = self.conv4(x)
-
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
         return x
+
 
 class QNet512(nn.Module):
 

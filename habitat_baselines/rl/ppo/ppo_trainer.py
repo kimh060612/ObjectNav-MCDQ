@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim
 import tqdm
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -20,15 +22,15 @@ from habitat_baselines.common.base_trainer import BaseRLTrainer
 from habitat_baselines.common.baseline_registry import baseline_registry
 from habitat_baselines.common.env_utils import construct_envs
 from habitat_baselines.common.environments import get_env_class
-from habitat_baselines.common.rollout_storage import RolloutStorage
+from habitat_baselines.common.rollout_storage import RolloutStorage, ReplayBuffer
 from habitat_baselines.common.tensorboard_utils import TensorboardWriter
 from habitat_baselines.common.utils import (
     batch_obs,
     generate_video,
     linear_decay,
 )
-from habitat_baselines.rl.ppo import PPO, PointNavBaselinePolicy, UncertainGoalPolicyNet
-from habitat_baselines.rl.models.geometry import OccupancyMap, SemanticMap
+from habitat_baselines.rl.ppo import PPO, PointNavBaselinePolicy, ObjectNavUncertainQAgent
+from habitat_baselines.rl.models.geometry import OccupancyMap, SemanticMap, to_grid, crop_global_map
 from habitat_baselines.rl.models.mobilenet import get_mobilenet_v3_small_seg
 
 @baseline_registry.register_trainer(name="ppo")
@@ -635,11 +637,8 @@ class PPOTrainer(BaseRLTrainer):
 
         self.envs.close()
 
-@baseline_registry.register_trainer(name="uncertain")
-class PPOUncertainTrainer(BaseRLTrainer):
-    r"""Trainer class for PPO algorithm
-    Paper: https://arxiv.org/abs/1707.06347.
-    """
+@baseline_registry.register_trainer(name="uncertain-q")
+class QNetUncertainTrainer(BaseRLTrainer):
     supported_tasks = ["Nav-v0"]
 
     def __init__(self, config=None):
@@ -653,7 +652,7 @@ class PPOUncertainTrainer(BaseRLTrainer):
         self._static_encoder = False
         self._encoder = None
 
-    def _setup_actor_critic_agent(self, dqn_cfg: Config, map_cfg: Config, device, num_process) -> None:
+    def _setup_dqn_agent(self, dqn_cfg: Config, map_cfg: Config, device, num_process) -> None:
         r"""Sets up actor critic and agent for PPO.
 
         Args:
@@ -676,27 +675,26 @@ class PPOUncertainTrainer(BaseRLTrainer):
             map_cfg.coordinate_min, map_cfg.coordinate_max,
             map_cfg.vacant_belief, map_cfg.occupied_belief
         )
+        self.grid_transform = to_grid(map_cfg.global_map_size, map_cfg.coordinate_min, map_cfg.coordinate_max)
         
-        self.semantic_encoder = get_mobilenet_v3_small_seg(dqn_cfg.num_classes, dqn_cfg.semantic_pretrain, True)
-        self.actor_critic = PointNavBaselinePolicy(
-            observation_space=self.envs.observation_spaces[0],
-            action_space=self.envs.action_spaces[0],
-            hidden_size=dqn_cfg.hidden_size,
+        self.semantic_encoder = get_mobilenet_v3_small_seg(dqn_cfg.num_classes, dqn_cfg.semantic_pretrain, True).to(self.device)
+        self.q_agent = ObjectNavUncertainQAgent(
             goal_sensor_uuid=self.config.TASK_CONFIG.TASK.GOAL_SENSOR_UUID,
+            num_local_steps=dqn_cfg.num_local_steps,
+            num_mc_drop=dqn_cfg.num_mc_drop,
+            mc_drop_rate=dqn_cfg.mc_drop_rate,
+            device=device,
+            num_classes=dqn_cfg.num_classes,
+            action_space=self.envs.action_spaces[0],
+            confidence=dqn_cfg.confidence_rate
         )
-        self.actor_critic.to(self.device)
-
-        self.agent = PPO(
-            actor_critic=self.actor_critic,
-            clip_param=dqn_cfg.clip_param,
-            ppo_epoch=dqn_cfg.ppo_epoch,
-            num_mini_batch=dqn_cfg.num_mini_batch,
-            value_loss_coef=dqn_cfg.value_loss_coef,
-            entropy_coef=dqn_cfg.entropy_coef,
+        self.q_agent.to(self.device)
+        self.loss_fn = nn.SmoothL1Loss().to(self.device)
+        self.optimizer = torch.optim.Adam(
+            list(filter(lambda p: p.requires_grad, self.q_agent.parameters())),
             lr=dqn_cfg.lr,
             eps=dqn_cfg.eps,
-            max_grad_norm=dqn_cfg.max_grad_norm,
-            use_normalized_advantage=dqn_cfg.use_normalized_advantage,
+            weight_decay=dqn_cfg.weight_decay
         )
 
     def save_checkpoint(
@@ -774,42 +772,50 @@ class PPOUncertainTrainer(BaseRLTrainer):
 
         return results
 
-    def _collect_rollout_step(
-        self, rollouts, current_episode_reward, running_episode_stats
+    def _unpack_batch(self, batch, map_cfg):
+        batch['rgb'] = batch['rgb'].permute(0, 3, 1, 2)
+        sem_img = self.semantic_encoder(batch['rgb'].to(self.device))
+        batch['semantic'] = torch.argmax(sem_img[0], dim=1)
+        self.occ_map_generator.update_map(batch)
+        self.sem_map_generator.update_map(batch)
+        global_allocentric_map = self.occ_map_generator.get_current_global_maps()
+        global_semantic_map = self.sem_map_generator.get_current_global_maps()
+        
+        ### Cropping the map to egocentric
+        local_occ_map = crop_global_map(
+            global_allocentric_map.unsqueeze(1), # B X 1 X H x W
+            batch['gps'], batch['compass'], self.grid_transform,
+            map_cfg.global_map_size, map_cfg.egocentric_map_size, self.device
+        )
+        local_semantic_map = crop_global_map(
+            global_semantic_map.permute(0, 3, 1, 2), # B X C X H x W
+            batch['gps'], batch['compass'], self.grid_transform,
+            map_cfg.global_map_size, map_cfg.egocentric_map_size, self.device
+        ).long()
+        return batch, local_occ_map, local_semantic_map
+
+    def _one_step_forward(self, 
+        obs_curr, occ_map_curr, sem_map_curr, 
+        current_episode_reward, running_episode_stats, map_cfg
     ):
         pth_time = 0.0
         env_time = 0.0
-
         t_sample_action = time.time()
-        # sample actions
         with torch.no_grad():
-            step_observation = {
-                k: v[rollouts.step] for k, v in rollouts.observations.items()
-            }
-
-            (
-                values,
-                actions,
-                actions_log_probs,
-                recurrent_hidden_states,
-            ) = self.actor_critic.act(
-                step_observation,
-                rollouts.recurrent_hidden_states[rollouts.step],
-                rollouts.prev_actions[rollouts.step],
-                rollouts.masks[rollouts.step],
-            )
-
+            actions = self.q_agent.act(obs_curr, occ_map_curr, sem_map_curr)
+        
         pth_time += time.time() - t_sample_action
-
         t_step_env = time.time()
 
-        outputs = self.envs.step([a[0].item() for a in actions])
+        outputs = self.envs.step([a.item() for a in actions])
         observations, rewards, dones, infos = [list(x) for x in zip(*outputs)]
-
+        
         env_time += time.time() - t_step_env
-
+        
         t_update_stats = time.time()
         batch = batch_obs(observations, device=self.device)
+        batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
+        
         rewards = torch.tensor(
             rewards, dtype=torch.float, device=current_episode_reward.device
         )
@@ -819,77 +825,63 @@ class PPOUncertainTrainer(BaseRLTrainer):
             [[0.0] if done else [1.0] for done in dones],
             dtype=torch.float,
             device=current_episode_reward.device,
-        )
+        ) # done: 0.0 == Done, 1.0 == Not Done
 
+        for idx, done in enumerate(dones):
+            if done:
+                self.occ_map_generator.reset_index(idx)
+                self.sem_map_generator.reset_index(idx)
+        
         current_episode_reward += rewards
         running_episode_stats["reward"] += (1 - masks) * current_episode_reward
         running_episode_stats["count"] += 1 - masks
-        for k, v in self._extract_scalars_from_infos(infos).items():
-            v = torch.tensor(
-                v, dtype=torch.float, device=current_episode_reward.device
-            ).unsqueeze(1)
-            if k not in running_episode_stats:
-                running_episode_stats[k] = torch.zeros_like(
-                    running_episode_stats["count"]
-                )
-
-            running_episode_stats[k] += (1 - masks) * v
-
-        current_episode_reward *= masks
-
-        if self._static_encoder:
-            with torch.no_grad():
-                batch["visual_features"] = self._encoder(batch)
-
-        rollouts.insert(
-            batch,
-            recurrent_hidden_states,
-            actions,
-            actions_log_probs,
-            values,
-            rewards,
-            masks,
+        
+        self.replay_buf.insert(
+            obs_curr, occ_map_curr.clone().detach(), sem_map_curr.clone().detach(), actions, rewards.to(self.device),
+            batch, local_occ_map.clone().detach(), local_semantic_map.clone().detach(), masks.to(self.device)
         )
-
+        
         pth_time += time.time() - t_update_stats
+        return batch, local_occ_map, local_semantic_map, pth_time, env_time, self.envs.num_envs
 
-        return pth_time, env_time, self.envs.num_envs
-
-    def _update_agent(self, ppo_cfg, rollouts):
-        t_update_model = time.time()
-        with torch.no_grad():
-            last_observation = {
-                k: v[rollouts.step] for k, v in rollouts.observations.items()
-            }
-            next_value = self.actor_critic.get_value(
-                last_observation,
-                rollouts.recurrent_hidden_states[rollouts.step],
-                rollouts.prev_actions[rollouts.step],
-                rollouts.masks[rollouts.step],
-            ).detach()
-
-        rollouts.compute_returns(
-            next_value, ppo_cfg.use_gae, ppo_cfg.gamma, ppo_cfg.tau
+    def _before_step(self):
+        nn.utils.clip_grad_norm_(
+            self.q_agent.parameters(), 0.2
         )
 
-        value_loss, action_loss, dist_entropy = self.agent.update(rollouts)
+    def _update_agent(self, ppo_cfg):
+        t_update_model = time.time()
+        mini_batches = self.replay_buf.sample_mini_batch()
+        
+        for _, data in enumerate(mini_batches):
+            (
+                obs_curr,
+                occ_curr,
+                sem_curr,
+                action_curr,
+                reward_curr,
+                obs_next,
+                occ_next,
+                sem_next,
+                mask
+            ) = data.data
 
-        rollouts.after_update()
-
+            q_main_pred, q_main_pred_var = self.q_agent.get_q_main(obs_curr, occ_curr, sem_curr, action_curr)
+            q_max_target = self.q_agent.get_target(obs_next, occ_next, sem_next)
+            target = reward_curr + ppo_cfg.discount * mask * q_max_target
+            loss = self.loss_fn(q_main_pred, target)
+            loss.backward()
+            self._before_step()
+            self.optimizer.step()
+        
+        self.q_agent.update_target()
         return (
             time.time() - t_update_model,
-            value_loss,
-            action_loss,
-            dist_entropy,
+            loss,
+            torch.mean(q_main_pred_var, dim=0)
         )
 
     def train(self) -> None:
-        r"""Main method for training PPO.
-
-        Returns:
-            None
-        """
-
         self.envs = construct_envs(
             self.config, get_env_class(self.config.ENV_NAME)
         )
@@ -903,33 +895,17 @@ class PPOUncertainTrainer(BaseRLTrainer):
         )
         if not os.path.isdir(self.config.CHECKPOINT_FOLDER):
             os.makedirs(self.config.CHECKPOINT_FOLDER)
-        self._setup_actor_critic_agent(dqn_cfg, map_cfg, self.device, self.config.NUM_PROCESSES)
+        self._setup_dqn_agent(dqn_cfg, map_cfg, self.device, self.config.NUM_PROCESSES)
+        self.replay_buf = ReplayBuffer(self.config.NUM_PROCESSES, dqn_cfg.num_mini_batch)
         logger.info(
             "agent number of parameters: {}".format(
-                sum(param.numel() for param in self.agent.parameters())
+                sum(param.numel() for param in self.q_agent.parameters())
             )
         )
 
-        rollouts = RolloutStorage(
-            dqn_cfg.num_steps,
-            self.envs.num_envs,
-            self.envs.observation_spaces[0],
-            self.envs.action_spaces[0],
-            dqn_cfg.hidden_size,
-        )
-        rollouts.to(self.device)
-
         observations = self.envs.reset()
         batch = batch_obs(observations, device=self.device)
-
-        for sensor in rollouts.observations:
-            rollouts.observations[sensor][0].copy_(batch[sensor])
-
-        # batch and observations may contain shared PyTorch CUDA
-        # tensors.  We must explicitly clear them here otherwise
-        # they will be kept in memory for the entire duration of training!
-        batch = None
-        observations = None
+        batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
 
         current_episode_reward = torch.zeros(self.envs.num_envs, 1)
         running_episode_stats = dict(
@@ -947,7 +923,7 @@ class PPOUncertainTrainer(BaseRLTrainer):
         count_checkpoints = 0
 
         lr_scheduler = LambdaLR(
-            optimizer=self.agent.optimizer,
+            optimizer=self.optimizer,
             lr_lambda=lambda x: linear_decay(x, self.config.NUM_UPDATES),
         )
 
@@ -958,91 +934,104 @@ class PPOUncertainTrainer(BaseRLTrainer):
                 if dqn_cfg.use_linear_lr_decay:
                     lr_scheduler.step()
 
-                if dqn_cfg.use_linear_clip_decay:
-                    self.agent.clip_param = dqn_cfg.clip_param * linear_decay(
-                        update, self.config.NUM_UPDATES
-                    )
+                q_loss = 0
+                action_uncertainty = 0
+                
+                for _ in range(dqn_cfg.num_steps):
+                    
+                    for _ in range(dqn_cfg.num_local_steps):
+                        
+                        (
+                            batch,
+                            local_occ_map,
+                            local_semantic_map,
+                            delta_pth_time,
+                            delta_env_time,
+                            delta_steps,
+                        ) = self._one_step_forward(
+                            batch, local_occ_map, local_semantic_map, 
+                            current_episode_reward, running_episode_stats, map_cfg
+                        )
+                        pth_time += delta_pth_time
+                        env_time += delta_env_time
+                        count_steps += delta_steps
 
-                for step in range(dqn_cfg.num_steps):
                     (
                         delta_pth_time,
-                        delta_env_time,
-                        delta_steps,
-                    ) = self._collect_rollout_step(
-                        rollouts, current_episode_reward, running_episode_stats
-                    )
+                        q_loss_t,
+                        action_uncertainty_t
+                    ) = self._update_agent(dqn_cfg)
                     pth_time += delta_pth_time
-                    env_time += delta_env_time
-                    count_steps += delta_steps
+                    q_loss += q_loss_t.item()
+                    action_uncertainty += action_uncertainty_t.item()
 
-                (
-                    delta_pth_time,
-                    value_loss,
-                    action_loss,
-                    dist_entropy,
-                ) = self._update_agent(dqn_cfg, rollouts)
-                pth_time += delta_pth_time
+                    q_loss /= dqn_cfg.num_local_steps
+                    action_uncertainty /= dqn_cfg.num_local_steps
 
-                for k, v in running_episode_stats.items():
-                    window_episode_stats[k].append(v.clone())
+                    self.replay_buf.reset()
+                    self.occ_map_generator.reset()
+                    self.sem_map_generator.reset()
+                    
+                    for k, v in running_episode_stats.items():
+                        window_episode_stats[k].append(v.clone())
 
-                deltas = {
-                    k: (
-                        (v[-1] - v[0]).sum().item()
-                        if len(v) > 1
-                        else v[0].sum().item()
-                    )
-                    for k, v in window_episode_stats.items()
-                }
-                deltas["count"] = max(deltas["count"], 1.0)
-
-                writer.add_scalar(
-                    "reward", deltas["reward"] / deltas["count"], count_steps
-                )
-
-                # Check to see if there are any metrics
-                # that haven't been logged yet
-                metrics = {
-                    k: v / deltas["count"]
-                    for k, v in deltas.items()
-                    if k not in {"reward", "count"}
-                }
-                if len(metrics) > 0:
-                    writer.add_scalars("metrics", metrics, count_steps)
-
-                losses = [value_loss, action_loss]
-                writer.add_scalars(
-                    "losses",
-                    {k: l for l, k in zip(losses, ["value", "policy"])},
-                    count_steps,
-                )
-
-                # log stats
-                if update > 0 and update % self.config.LOG_INTERVAL == 0:
-                    logger.info(
-                        "update: {}\tfps: {:.3f}\t".format(
-                            update, count_steps / (time.time() - t_start)
+                    deltas = {
+                        k: (
+                            (v[-1] - v[0]).sum().item()
+                            if len(v) > 1
+                            else v[0].sum().item()
                         )
+                        for k, v in window_episode_stats.items()
+                    }
+                    deltas["count"] = max(deltas["count"], 1.0)
+
+                    writer.add_scalar(
+                        "reward", deltas["reward"] / deltas["count"], count_steps
                     )
 
-                    logger.info(
-                        "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
-                        "frames: {}".format(
-                            update, env_time, pth_time, count_steps
+                    # Check to see if there are any metrics
+                    # that haven't been logged yet
+                    metrics = {
+                        k: v / deltas["count"]
+                        for k, v in deltas.items()
+                        if k not in {"reward", "count"}
+                    }
+                    if len(metrics) > 0:
+                        writer.add_scalars("metrics", metrics, count_steps)
+
+                    losses = [q_loss, action_uncertainty]
+                    writer.add_scalars(
+                        "q-training",
+                        {k: l for l, k in zip(losses, ["q_loss", "action_uncertainty"])},
+                        count_steps,
+                    )
+
+                    # log stats
+                    if update > 0 and update % self.config.LOG_INTERVAL == 0:
+                        logger.info(
+                            "update: {}\tfps: {:.3f}\t".format(
+                                update, count_steps / (time.time() - t_start)
+                            )
                         )
-                    )
 
-                    logger.info(
-                        "Average window size: {}  {}".format(
-                            len(window_episode_stats["count"]),
-                            "  ".join(
-                                "{}: {:.3f}".format(k, v / deltas["count"])
-                                for k, v in deltas.items()
-                                if k != "count"
-                            ),
+                        logger.info(
+                            "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
+                            "frames: {}".format(
+                                update, env_time, pth_time, count_steps
+                            )
                         )
-                    )
 
+                        logger.info(
+                            "Average window size: {}  {}".format(
+                                len(window_episode_stats["count"]),
+                                "  ".join(
+                                    "{}: {:.3f}".format(k, v / deltas["count"])
+                                    for k, v in deltas.items()
+                                    if k != "count"
+                                ),
+                            )
+                        )
+                        
                 # checkpoint model
                 if update % self.config.CHECKPOINT_INTERVAL == 0:
                     self.save_checkpoint(
@@ -1068,6 +1057,11 @@ class PPOUncertainTrainer(BaseRLTrainer):
         Returns:
             None
         """
+        self.device = (
+            torch.device("cuda", self.config.TORCH_GPU_ID)
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
         # Map location CPU is almost always better than mapping to a CUDA device.
         ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
 
@@ -1077,6 +1071,7 @@ class PPOUncertainTrainer(BaseRLTrainer):
             config = self.config.clone()
 
         ppo_cfg = config.RL.PPO
+        map_cfg = config.RL.MAPS
 
         config.defrost()
         config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
@@ -1090,22 +1085,22 @@ class PPOUncertainTrainer(BaseRLTrainer):
 
         logger.info(f"env config: {config}")
         self.envs = construct_envs(config, get_env_class(config.ENV_NAME))
-        self._setup_actor_critic_agent(ppo_cfg)
+        self._setup_dqn_agent(ppo_cfg, map_cfg, self.device, self.config.NUM_PROCESSES)
 
-        self.agent.load_state_dict(ckpt_dict["state_dict"])
-        self.actor_critic = self.agent.actor_critic
+        self.q_agent.load_state_dict(ckpt_dict["state_dict"])
 
         observations = self.envs.reset()
         batch = batch_obs(observations, device=self.device)
-
+        batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
+        
         current_episode_reward = torch.zeros(
             self.envs.num_envs, 1, device=self.device
         )
 
         test_recurrent_hidden_states = torch.zeros(
-            self.actor_critic.net.num_recurrent_layers,
+            256,
             self.config.NUM_PROCESSES,
-            ppo_cfg.hidden_size,
+            512,
             device=self.device,
         )
         prev_actions = torch.zeros(
@@ -1123,7 +1118,8 @@ class PPOUncertainTrainer(BaseRLTrainer):
             os.makedirs(self.config.VIDEO_DIR, exist_ok=True)
 
         pbar = tqdm.tqdm(total=self.config.TEST_EPISODE_COUNT)
-        self.actor_critic.eval()
+        self.q_agent.eval()
+        
         while (
             len(stats_episodes) < self.config.TEST_EPISODE_COUNT
             and self.envs.num_envs > 0
@@ -1131,20 +1127,7 @@ class PPOUncertainTrainer(BaseRLTrainer):
             current_episodes = self.envs.current_episodes()
 
             with torch.no_grad():
-                (
-                    _,
-                    actions,
-                    _,
-                    test_recurrent_hidden_states,
-                ) = self.actor_critic.act(
-                    batch,
-                    test_recurrent_hidden_states,
-                    prev_actions,
-                    not_done_masks,
-                    deterministic=False,
-                )
-
-                prev_actions.copy_(actions)
+                actions = self.q_agent.act(observations, local_occ_map, local_semantic_map)
 
             outputs = self.envs.step([a[0].item() for a in actions])
 
@@ -1152,12 +1135,18 @@ class PPOUncertainTrainer(BaseRLTrainer):
                 list(x) for x in zip(*outputs)
             ]
             batch = batch_obs(observations, device=self.device)
+            batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
 
             not_done_masks = torch.tensor(
                 [[0.0] if done else [1.0] for done in dones],
                 dtype=torch.float,
                 device=self.device,
             )
+            
+            for idx, done in enumerate(dones):
+                if done:
+                    self.occ_map_generator.reset_index(idx)
+                    self.sem_map_generator.reset_index(idx)
 
             rewards = torch.tensor(
                 rewards, dtype=torch.float, device=self.device

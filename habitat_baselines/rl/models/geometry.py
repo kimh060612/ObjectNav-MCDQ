@@ -388,7 +388,7 @@ class Registration():
         registered_map = (global_allocentric_map + translated) # B X C X H X W
         
         return registered_map.permute(0, 2, 3, 1)
-    
+
 class SemanticMap():
     def __init__(self,
             global_map_size, egocentric_map_size, num_process, num_classes,
@@ -397,6 +397,7 @@ class SemanticMap():
         self.num_process = num_process
         self.global_map_size = global_map_size
         self.egocentric_map_size = egocentric_map_size
+        self.num_classes = num_classes
         self.global_allocentric_semantic_map = torch.zeros(
             self.num_process,
             self.global_map_size,
@@ -413,9 +414,24 @@ class SemanticMap():
             self.num_process, device
         )
     
+    def reset_index(self, idx):
+        self.global_allocentric_semantic_map[idx, ...] = torch.zeros(
+            self.global_map_size,
+            self.global_map_size,
+            self.num_classes
+        )
+    
+    def reset(self):
+        self.global_allocentric_semantic_map = torch.zeros(
+            self.num_process,
+            self.global_map_size,
+            self.global_map_size,
+            self.num_classes
+        )
+    
     def get_current_global_maps(self) -> torch.Tensor:
         gasm = torch.argmax(self.global_allocentric_semantic_map, dim=-1)
-        gasm = F.one_hot(gasm.long(), num_classes=23)
+        gasm = F.one_hot(gasm.long(), num_classes=23).long()
         return gasm
     
     def update_map(self, observations: Dict[str, torch.Tensor]):
@@ -457,6 +473,19 @@ class OccupancyMap():
             self.num_process, device
         )
 
+    def reset_index(self, idx):
+        self.global_allocentric_occupancy_map[idx, ...] = torch.zeros(
+            self.global_map_size,
+            self.global_map_size,
+        )
+
+    def reset(self):
+        self.global_allocentric_occupancy_map = torch.zeros(
+            self.num_process,
+            self.global_map_size,
+            self.global_map_size
+        )
+
     def _belief_to_prob(self, x: torch.Tensor) -> torch.Tensor:
         return 1. - 1./(1 + torch.exp(x))
 
@@ -485,80 +514,29 @@ class OccupancyMap():
         self.global_allocentric_occupancy_map = self.registration.forward(observations, self.global_allocentric_occupancy_map, projection)
         
 
-class OccupancyMapRollout():
-    def __init__(self, global_map_size, egocentric_map_size, num_process, num_steps,
-            device, coordinate_min, coordinate_max, vaccant_bel, occupied_bel, 
-            height_min=-0.7, height_max=0.8
-        ):
-        self.num_process = num_process
-        self.global_map_size = global_map_size
-        self.egocentric_map_size = egocentric_map_size
-        self.BEL_VAC = vaccant_bel
-        self.BEL_OCC = occupied_bel
-        self.num_steps = num_steps
-        self.step = 0
-        self.device = device
-        ## global egocentric/allocentric map: (!!!) This is belief map, not the probability
-        self.global_allocentric_occupancy_map = torch.zeros(
-            self.num_steps + 1,
-            self.num_process,
-            self.global_map_size,
-            self.global_map_size,
-            device=device
-        )
-        self.global_egocentric_occupancy_map = torch.zeros(
-            self.num_steps + 1,
-            self.num_process,
-            self.global_map_size,
-            self.global_map_size,
-            device=device
-        )
-        self.occupancy_projection = ProjectToGroundPlane(
-            self.egocentric_map_size, self.global_map_size, device, 
-            coordinate_min, coordinate_max, self.BEL_VAC, self.BEL_OCC, 
-            height_min, height_max
-        )
-        self.registration = Registration(
-            self.egocentric_map_size, self.global_map_size, coordinate_min, coordinate_max, self.num_process, device
-        )
-    
-    def __getitem__(self, index):
-        geom = self._belief_to_prob(self.global_egocentric_occupancy_map)
-        return geom[index, ...]
-    
-    def _belief_to_prob(self, x: torch.Tensor) -> torch.Tensor:
-        return 1. - 1./(1 + torch.exp(x))
-    
-    def get_current_global_maps(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        '''
-            Transform the belief map toward probability map
-            
-            Return:
-                - Global Allocentric Map \in (batch size, channel=1, global map size, global map size)
-                - Global Egocentric Map \in (batch size, channel=1, global map size, global map size)
-            Map contents 
-            M_{i,j} = 0: Vaccant
-            M_{i,j} = 1: Occupied
-            Otherwise: uncertainty between them.
-        '''
-        gaom = self._belief_to_prob(self.global_allocentric_occupancy_map)
-        geom = self._belief_to_prob(self.global_egocentric_occupancy_map)
-        return gaom, geom
-    
-    def after_update(self):
-        self.global_allocentric_occupancy_map[0].copy_(
-            self.global_allocentric_occupancy_map[self.step]
-        )
-        self.global_egocentric_occupancy_map[0].copy_(
-            self.global_egocentric_occupancy_map[self.step]
-        )
-        self.step = 0
-    
-    def update_map(self, observations: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        depth = observations["depth"].clone().detach().to(self.device)
+def crop_global_map(global_map, gps_coord, compass, grid_t: to_grid, global_map_size, ego_map_size, device):
+    """
+    global semantic map: B X C X H X W
+    global occupancy map: B X 1 X H X W
+    """
+    global_map_t = global_map.clone().detach().float()
+    grid_x, grid_y = grid_t.get_grid_coords(gps_coord)
+    st_pose = torch.cat(
+        [
+            (grid_y.unsqueeze(1) - (global_map_size//2))/(global_map_size//2),
+            (grid_x.unsqueeze(1) - (global_map_size//2))/(global_map_size//2),
+            -compass
+        ], 
+        dim=1
+    ).to(device)
+    rot_mat, trans_mat = get_grid(st_pose, global_map_t.size(), device)
         
-        # Project to 2D map & Generate 2D local egocentric map
-        projection = self.occupancy_projection.forward(depth * 10.)
-        # Update global allocentric map & Get global egocentric map
-        self.global_allocentric_occupancy_map[self.step + 1] = self.registration.forward(observations, self.global_allocentric_occupancy_map[self.step], projection)
-        self.step += 1
+    # Warpping for global allocentric map
+    rotated = F.grid_sample(global_map_t, rot_mat, align_corners=True, mode='nearest')
+    translated = F.grid_sample(rotated, trans_mat, align_corners=True, mode='nearest')
+    
+    c_h, c_w = global_map_size // 2, global_map_size // 2
+    return translated[:, :,
+        c_h - ego_map_size // 2: c_h + ego_map_size // 2, 
+        c_w - ego_map_size // 2: c_w + ego_map_size // 2
+    ].permute(0, 2, 3, 1)

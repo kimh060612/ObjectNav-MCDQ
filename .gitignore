@@ -89,3 +89,4 @@ data
 *.swp
 
 segmentation_ckp
+tb/*

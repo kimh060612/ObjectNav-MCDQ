@@ -7,7 +7,7 @@
 from collections import defaultdict
 
 import torch
-
+from random import sample
 
 class RolloutStorage:
     r"""Class for storing rollout information for RL trainers.
@@ -240,3 +240,143 @@ class RolloutStorage:
             flattened tensor of size (t*n, ...)
         """
         return tensor.view(t * n, *tensor.size()[2:])
+
+
+class ReplayData():
+    """
+    Here we define the one-batch update data (s, a, r, s^{'})
+    The elements are torch.Tensor for NUM_PROCESS batch size.
+    
+    s_t and action: observation['rgb', 'depth', 'semantic', 'gps', 'compass'], local_occupancy_map and local_semantic_map
+    r: reward
+    s^{'}: s_{t+1}
+    
+    Important: The Crop ratio need to be re-considered. Now it is same with egocentric map size
+    """
+    def __init__(self,
+        observations_curr,
+        local_occupancy_map_curr,
+        local_semantic_map_curr,
+        action, 
+        reward,
+        observations_next,
+        local_occupancy_map_next,
+        local_semantic_map_next,
+        done_mask
+    ):
+        """
+        observations['rgb']: B X C X H X W
+        observations['depth']: B X 1 X H X W
+        observations['semantic']: B X C X H X W
+        observations['gps']: B X 2
+        observations['compass']: B X 1
+        local_occupancy_map: B X H X W
+        local_semantic_map: B X C X H X W
+        """
+        self.observations_curr = observations_curr
+        self.local_occupancy_map_curr = local_occupancy_map_curr
+        self.local_semantic_map_curr = local_semantic_map_curr
+        self.action = action
+        self.reward = reward
+        self.observations_next = observations_next
+        self.local_occupancy_map_next = local_occupancy_map_next
+        self.local_semantic_map_next = local_semantic_map_next
+        self.done_mask = done_mask
+    
+    @property
+    def data(self):
+        return (
+            self.observations_curr,
+            self.local_occupancy_map_curr,
+            self.local_semantic_map_curr,
+            self.action,
+            self.reward,
+            self.observations_next,
+            self.local_occupancy_map_next,
+            self.local_semantic_map_next,
+            self.done_mask
+        )
+
+class ReplayBuffer:
+    """
+    store the mini-batches for Deep Q Network
+    """
+    def __init__(self, 
+        num_process,
+        num_mini_batch,
+    ):
+        self.num_process = num_process
+        self.num_mini_batch = num_mini_batch
+        self.replay = []
+    
+    def reset(self):
+        self.replay.clear()
+    
+    def insert(self,
+        observations_curr,
+        local_occupancy_map_curr,
+        local_semantic_map_curr,
+        action,
+        reward,
+        observations_next,
+        local_occupancy_map_next,
+        local_semantic_map_next,
+        done_mask
+    ):
+        data = ReplayData(
+            observations_curr,
+            local_occupancy_map_curr,
+            local_semantic_map_curr,
+            action,
+            reward,
+            observations_next,
+            local_occupancy_map_next,
+            local_semantic_map_next,
+            done_mask
+        )
+        self.replay.append(data)
+
+    def sample_mini_batch(self):
+        mini_batches = sample(self.replay, self.num_mini_batch)
+        return mini_batches
+        
+# list_obs_curr = []
+# list_occ_map_curr = []
+# list_sem_map_curr = []
+# list_action_curr = []
+# list_reward_curr = []
+# list_obs_next = []
+# list_occ_map_next = []
+# list_sem_map_next = []
+# list_done_mask = []
+# for _, data in enumerate(mini_batches):
+#     (
+#         observations_curr,
+#         local_occupancy_map_curr,
+#         local_semantic_map_curr,
+#         actions, 
+#         reward,
+#         observations_next,
+#         local_occupancy_map_next,
+#         local_semantic_map_next,
+#         done_mask
+#     ) = data.data
+#     list_obs_curr.append(observations_curr)
+#     list_occ_map_curr.append(local_occupancy_map_curr)
+#     list_sem_map_curr.append(local_semantic_map_curr)
+#     list_action_curr.append(actions)
+#     list_reward_curr.append(reward)
+#     list_obs_next.append(observations_next)
+#     list_occ_map_next.append(local_occupancy_map_next)
+#     list_sem_map_next.append(local_semantic_map_next)
+#     list_done_mask.append(done_mask)
+
+#     obs_curr = torch.cat(list_obs_curr, dim=0)
+#     occ_curr = torch.cat(list_occ_map_curr, dim=0)
+#     sem_curr = torch.cat(list_sem_map_curr, dim=0)
+#     action_curr = torch.cat(list_action_curr, dim=0)
+#     reward_curr = torch.cat(list_reward_curr, dim=0)
+#     obs_next = torch.cat(list_obs_next, dim=0)
+#     occ_next = torch.cat(list_occ_map_next, dim=0)
+#     sem_next = torch.cat(list_sem_map_next, dim=0)
+#     mask = torch.cat(list_done_mask, dim=0)

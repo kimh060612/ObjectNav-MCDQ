@@ -127,8 +127,8 @@ class MobileNetV3(nn.Module):
 
 def get_mobilenet_v3(mode='small', width_mult=1.0, pretrained=False, root='~/,torch/models', **kwargs):
     model = MobileNetV3(mode=mode, width_mult=width_mult, **kwargs)
-    if pretrained:
-        raise ValueError("Not support pretrained")
+    # if pretrained:
+    #     raise ValueError("Not support pretrained")
     return model
 
 
