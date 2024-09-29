@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import torch
 from random import sample
+from typing import Dict, List
 
 class RolloutStorage:
     r"""Class for storing rollout information for RL trainers.
@@ -262,7 +263,8 @@ class ReplayData():
         observations_next,
         local_occupancy_map_next,
         local_semantic_map_next,
-        done_mask
+        done_mask,
+        device
     ):
         """
         observations['rgb']: B X C X H X W
@@ -282,19 +284,23 @@ class ReplayData():
         self.local_occupancy_map_next = local_occupancy_map_next
         self.local_semantic_map_next = local_semantic_map_next
         self.done_mask = done_mask
+        self.device = device
+    
+    def _to_obs(self, batch: Dict[str, torch.Tensor]):
+        return { k: v.to(self.device) for k, v in batch.items() }
     
     @property
     def data(self):
         return (
-            self.observations_curr,
-            self.local_occupancy_map_curr,
-            self.local_semantic_map_curr,
-            self.action,
-            self.reward,
-            self.observations_next,
-            self.local_occupancy_map_next,
-            self.local_semantic_map_next,
-            self.done_mask
+            self._to_obs(self.observations_curr),
+            self.local_occupancy_map_curr.to(self.device),
+            self.local_semantic_map_curr.to(self.device),
+            self.action.to(self.device),
+            self.reward.to(self.device),
+            self._to_obs(self.observations_next),
+            self.local_occupancy_map_next.to(self.device),
+            self.local_semantic_map_next.to(self.device),
+            self.done_mask.to(self.device)
         )
 
 class ReplayBuffer:
@@ -304,10 +310,16 @@ class ReplayBuffer:
     def __init__(self, 
         num_process,
         num_mini_batch,
+        device
     ):
         self.num_process = num_process
         self.num_mini_batch = num_mini_batch
         self.replay = []
+        self.device_cpu = torch.device('cpu')
+        self.device_gpu = device
+    
+    def __len__(self,):
+        return len(self.replay)
     
     def reset(self):
         self.replay.clear()
@@ -324,59 +336,83 @@ class ReplayBuffer:
         done_mask
     ):
         data = ReplayData(
-            observations_curr,
-            local_occupancy_map_curr,
-            local_semantic_map_curr,
-            action,
-            reward,
-            observations_next,
-            local_occupancy_map_next,
-            local_semantic_map_next,
-            done_mask
+            self._to_obs(observations_curr),
+            local_occupancy_map_curr.to(self.device_cpu),
+            local_semantic_map_curr.to(self.device_cpu),
+            action.to(self.device_cpu),
+            reward.to(self.device_cpu),
+            self._to_obs(observations_next),
+            local_occupancy_map_next.to(self.device_cpu),
+            local_semantic_map_next.to(self.device_cpu),
+            done_mask.to(self.device_cpu),
+            device=self.device_gpu
         )
         self.replay.append(data)
 
-    def sample_mini_batch(self):
-        mini_batches = sample(self.replay, self.num_mini_batch)
-        return mini_batches
-        
-# list_obs_curr = []
-# list_occ_map_curr = []
-# list_sem_map_curr = []
-# list_action_curr = []
-# list_reward_curr = []
-# list_obs_next = []
-# list_occ_map_next = []
-# list_sem_map_next = []
-# list_done_mask = []
-# for _, data in enumerate(mini_batches):
-#     (
-#         observations_curr,
-#         local_occupancy_map_curr,
-#         local_semantic_map_curr,
-#         actions, 
-#         reward,
-#         observations_next,
-#         local_occupancy_map_next,
-#         local_semantic_map_next,
-#         done_mask
-#     ) = data.data
-#     list_obs_curr.append(observations_curr)
-#     list_occ_map_curr.append(local_occupancy_map_curr)
-#     list_sem_map_curr.append(local_semantic_map_curr)
-#     list_action_curr.append(actions)
-#     list_reward_curr.append(reward)
-#     list_obs_next.append(observations_next)
-#     list_occ_map_next.append(local_occupancy_map_next)
-#     list_sem_map_next.append(local_semantic_map_next)
-#     list_done_mask.append(done_mask)
+    def _to_obs(self, batch: Dict[str, torch.Tensor]):
+        return { k: v.to(self.device_cpu) for k, v in batch.items() }
 
-#     obs_curr = torch.cat(list_obs_curr, dim=0)
-#     occ_curr = torch.cat(list_occ_map_curr, dim=0)
-#     sem_curr = torch.cat(list_sem_map_curr, dim=0)
-#     action_curr = torch.cat(list_action_curr, dim=0)
-#     reward_curr = torch.cat(list_reward_curr, dim=0)
-#     obs_next = torch.cat(list_obs_next, dim=0)
-#     occ_next = torch.cat(list_occ_map_next, dim=0)
-#     sem_next = torch.cat(list_sem_map_next, dim=0)
-#     mask = torch.cat(list_done_mask, dim=0)
+    def _make_batch(self, obs_list: List[Dict[str, torch.Tensor]]):
+        obs_new_batch = { k: [] for k, _ in obs_list[0].items() }
+        for obs in obs_list:
+            for k, v in obs.items():
+                obs_new_batch[k].append(v)
+        return { k: torch.cat(v, dim=0) for k, v in obs_new_batch.items() }
+
+    def sample_mini_batch(self):
+        mini_batches = self.replay if len(self) < self.num_mini_batch \
+                                    else sample(self.replay, self.num_mini_batch)
+        
+        list_obs_curr = []
+        list_occ_map_curr = []
+        list_sem_map_curr = []
+        list_action_curr = []
+        list_reward_curr = []
+        list_obs_next = []
+        list_occ_map_next = []
+        list_sem_map_next = []
+        list_done_mask = []
+        for _, data in enumerate(mini_batches):
+            (
+                observations_curr,
+                local_occupancy_map_curr,
+                local_semantic_map_curr,
+                actions, 
+                reward,
+                observations_next,
+                local_occupancy_map_next,
+                local_semantic_map_next,
+                done_mask
+            ) = data.data
+            list_obs_curr.append(observations_curr)
+            list_occ_map_curr.append(local_occupancy_map_curr)
+            list_sem_map_curr.append(local_semantic_map_curr)
+            list_action_curr.append(actions)
+            list_reward_curr.append(reward)
+            list_obs_next.append(observations_next)
+            list_occ_map_next.append(local_occupancy_map_next)
+            list_sem_map_next.append(local_semantic_map_next)
+            list_done_mask.append(done_mask)
+
+        obs_curr = self._make_batch(list_obs_curr)
+        occ_curr = torch.cat(list_occ_map_curr, dim=0)
+        sem_curr = torch.cat(list_sem_map_curr, dim=0)
+        action_curr = torch.cat(list_action_curr, dim=0)
+        reward_curr = torch.cat(list_reward_curr, dim=0)
+        obs_next = self._make_batch(list_obs_next)
+        occ_next = torch.cat(list_occ_map_next, dim=0)
+        sem_next = torch.cat(list_sem_map_next, dim=0)
+        mask = torch.cat(list_done_mask, dim=0)
+        
+        return (
+            obs_curr,
+            occ_curr,
+            sem_curr,
+            action_curr,
+            reward_curr,
+            obs_next,
+            occ_next,
+            sem_next,
+            mask
+        )
+        

@@ -78,10 +78,12 @@ class QNet(nn.Module):
         self.drop_4 = nn.Dropout(p=self.drop_rate) # MC Dropout 
 
         self.conv2 = nn.Conv2d(512, 128, kernel_size=1, stride=1)
+        self.drop_5 = nn.Dropout(p=self.drop_rate) # MC Dropout 
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(128, num_actions)
-
+        self.drop_f = nn.Dropout(p=self.drop_rate) # MC Dropout 
+        
         if not is_target:
             self._init_weights(nn.init.kaiming_normal_)
         else:
@@ -109,7 +111,7 @@ class QNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
-
+        ### TODO: Need to implement more complex Q-Net
         '''
         obs = x[:, :self.num_channel,...]
         goal = x[:, self.num_channel:2*self.num_channel, ...]
@@ -136,10 +138,12 @@ class QNet(nn.Module):
         x = self.drop_4(x)
 
         x = self.conv2(x)
+        x = self.drop_5(x)
         x = self.relu(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
+        x = self.drop_f(x)
         return x
 
 

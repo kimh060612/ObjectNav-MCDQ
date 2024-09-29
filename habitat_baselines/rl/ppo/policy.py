@@ -104,7 +104,8 @@ class QAgent(nn.Module):
         return q_max_t.unsqueeze(1)
 
     def update_target(self):
-        self.target.Q_net.load_state_dict(self.q_net.Q_net.state_dict())
+        for param_a, param_b in zip(self.target.Q_net.parameters(), self.q_net.Q_net.parameters()):
+            param_b.data.copy_(param_a.data)
 
 
 class CriticHead(nn.Module):

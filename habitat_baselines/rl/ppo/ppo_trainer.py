@@ -709,7 +709,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
             None
         """
         checkpoint = {
-            "state_dict": self.agent.state_dict(),
+            "state_dict": self.q_agent.state_dict(),
             "config": self.config,
         }
         if extra_state is not None:
@@ -794,6 +794,14 @@ class QNetUncertainTrainer(BaseRLTrainer):
         ).long()
         return batch, local_occ_map, local_semantic_map
 
+    def _entropy(self, x):
+        x = x + 1e-10
+        entropy = -torch.sum(x * torch.log(x), dim=(1, 2, 3))
+        return entropy
+    
+    def _get_gain_reward(self, m_curr, m_next):
+        return self._entropy(m_curr) - self._entropy(m_next)
+
     def _one_step_forward(self, 
         obs_curr, occ_map_curr, sem_map_curr, 
         current_episode_reward, running_episode_stats, map_cfg
@@ -816,17 +824,18 @@ class QNetUncertainTrainer(BaseRLTrainer):
         batch = batch_obs(observations, device=self.device)
         batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
         
+        occ_reward = self._get_gain_reward(occ_map_curr, local_occ_map).unsqueeze(1).to(torch.device('cpu'))
         rewards = torch.tensor(
             rewards, dtype=torch.float, device=current_episode_reward.device
         )
-        rewards = rewards.unsqueeze(1)
+        rewards = rewards.unsqueeze(1) + map_cfg.entropy_coef * occ_reward
 
         masks = torch.tensor(
             [[0.0] if done else [1.0] for done in dones],
             dtype=torch.float,
             device=current_episode_reward.device,
         ) # done: 0.0 == Done, 1.0 == Not Done
-
+        
         for idx, done in enumerate(dones):
             if done:
                 self.occ_map_generator.reset_index(idx)
@@ -835,6 +844,18 @@ class QNetUncertainTrainer(BaseRLTrainer):
         current_episode_reward += rewards
         running_episode_stats["reward"] += (1 - masks) * current_episode_reward
         running_episode_stats["count"] += 1 - masks
+        for k, v in self._extract_scalars_from_infos(infos).items():
+            v = torch.tensor(
+                v, dtype=torch.float, device=current_episode_reward.device
+            ).unsqueeze(1)
+            if k not in running_episode_stats:
+                running_episode_stats[k] = torch.zeros_like(
+                    running_episode_stats["count"]
+                )
+
+            running_episode_stats[k] += (1 - masks) * v
+
+        current_episode_reward *= masks
         
         self.replay_buf.insert(
             obs_curr, occ_map_curr.clone().detach(), sem_map_curr.clone().detach(), actions, rewards.to(self.device),
@@ -851,28 +872,25 @@ class QNetUncertainTrainer(BaseRLTrainer):
 
     def _update_agent(self, ppo_cfg):
         t_update_model = time.time()
-        mini_batches = self.replay_buf.sample_mini_batch()
-        
-        for _, data in enumerate(mini_batches):
-            (
-                obs_curr,
-                occ_curr,
-                sem_curr,
-                action_curr,
-                reward_curr,
-                obs_next,
-                occ_next,
-                sem_next,
-                mask
-            ) = data.data
+        (
+            obs_curr,
+            occ_curr,
+            sem_curr,
+            action_curr,
+            reward_curr,
+            obs_next,
+            occ_next,
+            sem_next,
+            mask
+        ) = self.replay_buf.sample_mini_batch()
 
-            q_main_pred, q_main_pred_var = self.q_agent.get_q_main(obs_curr, occ_curr, sem_curr, action_curr)
-            q_max_target = self.q_agent.get_target(obs_next, occ_next, sem_next)
-            target = reward_curr + ppo_cfg.discount * mask * q_max_target
-            loss = self.loss_fn(q_main_pred, target)
-            loss.backward()
-            self._before_step()
-            self.optimizer.step()
+        q_main_pred, q_main_pred_var = self.q_agent.get_q_main(obs_curr, occ_curr, sem_curr, action_curr)
+        q_max_target = self.q_agent.get_target(obs_next, occ_next, sem_next)
+        target = reward_curr + ppo_cfg.discount * mask * q_max_target
+        loss = self.loss_fn(q_main_pred, target)
+        loss.backward()
+        self._before_step()
+        self.optimizer.step()
         
         self.q_agent.update_target()
         return (
@@ -896,7 +914,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
         if not os.path.isdir(self.config.CHECKPOINT_FOLDER):
             os.makedirs(self.config.CHECKPOINT_FOLDER)
         self._setup_dqn_agent(dqn_cfg, map_cfg, self.device, self.config.NUM_PROCESSES)
-        self.replay_buf = ReplayBuffer(self.config.NUM_PROCESSES, dqn_cfg.num_mini_batch)
+        self.replay_buf = ReplayBuffer(self.config.NUM_PROCESSES, dqn_cfg.num_mini_batch, self.device)
         logger.info(
             "agent number of parameters: {}".format(
                 sum(param.numel() for param in self.q_agent.parameters())
@@ -930,14 +948,14 @@ class QNetUncertainTrainer(BaseRLTrainer):
         with TensorboardWriter(
             self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
         ) as writer:
-            for update in range(self.config.NUM_UPDATES):
+            for update in range(1, self.config.NUM_UPDATES + 1):
                 if dqn_cfg.use_linear_lr_decay:
                     lr_scheduler.step()
 
                 q_loss = 0
                 action_uncertainty = 0
                 
-                for _ in range(dqn_cfg.num_steps):
+                for n_s in range(dqn_cfg.num_steps // dqn_cfg.num_local_steps):
                     
                     for _ in range(dqn_cfg.num_local_steps):
                         
@@ -968,7 +986,8 @@ class QNetUncertainTrainer(BaseRLTrainer):
                     q_loss /= dqn_cfg.num_local_steps
                     action_uncertainty /= dqn_cfg.num_local_steps
 
-                    self.replay_buf.reset()
+                    if len(self.replay_buf) >= dqn_cfg.replay_buffer_size:
+                        self.replay_buf.reset()
                     self.occ_map_generator.reset()
                     self.sem_map_generator.reset()
                     
@@ -997,8 +1016,11 @@ class QNetUncertainTrainer(BaseRLTrainer):
                         if k not in {"reward", "count"}
                     }
                     if len(metrics) > 0:
-                        writer.add_scalars("metrics", metrics, count_steps)
-
+                        writer.add_scalar("metrics/episode_length", metrics["episode_length"], count_steps)
+                        writer.add_scalar("metrics/success", metrics["success"], count_steps)
+                        writer.add_scalar("metrics/distance_to_goal", metrics["distance_to_goal"], count_steps)
+                        writer.add_scalar("metrics/spl", metrics["spl"], count_steps)
+                        
                     losses = [q_loss, action_uncertainty]
                     writer.add_scalars(
                         "q-training",
@@ -1007,7 +1029,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
                     )
 
                     # log stats
-                    if update > 0 and update % self.config.LOG_INTERVAL == 0:
+                    if ((update + 1) * (n_s + 1)) % self.config.LOG_INTERVAL == 0:
                         logger.info(
                             "update: {}\tfps: {:.3f}\t".format(
                                 update, count_steps / (time.time() - t_start)
@@ -1020,7 +1042,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
                                 update, env_time, pth_time, count_steps
                             )
                         )
-
+                        
                         logger.info(
                             "Average window size: {}  {}".format(
                                 len(window_episode_stats["count"]),
@@ -1032,12 +1054,12 @@ class QNetUncertainTrainer(BaseRLTrainer):
                             )
                         )
                         
-                # checkpoint model
-                if update % self.config.CHECKPOINT_INTERVAL == 0:
-                    self.save_checkpoint(
-                        f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
-                    )
-                    count_checkpoints += 1
+                    # checkpoint model
+                    if (update * (n_s + 1)) % self.config.CHECKPOINT_INTERVAL == 0:
+                        self.save_checkpoint(
+                            f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
+                        )
+                        count_checkpoints += 1
 
             self.envs.close()
 

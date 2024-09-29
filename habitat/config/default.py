@@ -134,6 +134,11 @@ _C.TASK.SUCCESS.SUCCESS_DISTANCE = 0.2
 _C.TASK.SPL = CN()
 _C.TASK.SPL.TYPE = "SPL"
 # -----------------------------------------------------------------------------
+# # EPISODE_LENGTH MEASUREMENT
+# -----------------------------------------------------------------------------
+_C.TASK.EPISODE_LENGTH = CN()
+_C.TASK.EPISODE_LENGTH.TYPE = "EpisodeLength"
+# -----------------------------------------------------------------------------
 # TopDownMap MEASUREMENT
 # -----------------------------------------------------------------------------
 _C.TASK.TOP_DOWN_MAP = CN()

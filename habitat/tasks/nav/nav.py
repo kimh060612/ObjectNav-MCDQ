@@ -821,6 +821,33 @@ class TopDownMap(Measure):
                 / (self._coordinate_max - self._coordinate_min),
             )
 
+@registry.register_measure
+class EpisodeLength(Measure):
+    r"""Calculates the episode length
+    """
+    cls_uuid: str = "episode_length"
+
+    def __init__(
+        self, *args: Any, sim: Simulator, config: Config, **kwargs: Any
+    ):
+        self._episode_length = None
+        self._sim = sim
+        self._config = config
+
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return self.cls_uuid
+
+    def reset_metric(self, *args: Any, episode, task, **kwargs: Any):
+        self._episode_length = 0
+        self._metric = self._episode_length
+
+    def update_metric(
+        self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any
+    ):
+        self._episode_length += 1
+        self._metric = self._episode_length
 
 @registry.register_measure
 class DistanceToGoal(Measure):
