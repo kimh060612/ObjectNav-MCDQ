@@ -93,9 +93,12 @@ class ComputePointCloud():
     ):
         self.device = device
         self.cx, self.cy = 256./2., 256./2.   
-        # self.fx = self.fy =  (256. / 2.) / np.tan(np.deg2rad(79 / 2.)) # Hard coded camera parameters
         self.fx = (256. / 2.) / np.tan(np.deg2rad(79 / 2.))
         self.fy = (256. / 2.) / np.tan(np.deg2rad(79 / 2.))
+        # self.cx, self.cy = 640./2., 480./2.   
+        # self.fx = (640. / 2.) / np.tan(np.deg2rad(90 / 2.))
+        # self.fy = (480. / 2.) / np.tan(np.deg2rad(67.5 / 2.))
+        
         self.egocentric_map_size = egocentric_map_size
         self.local_scale = float(coordinate_max - coordinate_min)/float(global_map_size)
         self.height_min = height_min
@@ -115,9 +118,9 @@ class ComputePointCloud():
         Y = yy * Z
         
         if self.is_occ:
-            self.height_min -= 0.2
-
-        valid_inputs = (depth != 0) & (depth <= 10.) & (Y > self.height_min) & (Y < self.height_max)
+            valid_inputs = (depth != 0) & (depth <= 10.) & (Y < self.height_max)
+        else:
+            valid_inputs = (depth != 0) & (depth <= 10.) & (Y > self.height_min) & (Y < self.height_max)
         # X ground projection and Y ground projection
         x_gp = ( (X / self.local_scale) + (self.egocentric_map_size-1)/2).round().long() # (bs, 1, imh, imw)
         y_gp = (-(Z / self.local_scale) + (self.egocentric_map_size-1)/2).round().long() # (bs, 1, imh, imw)
@@ -159,24 +162,25 @@ class ProjectToGroundPlane():
         # Set the idxes for all invalid locations to (0, 0)
         spatial_locs_ss[:, 0][invalid_spatial_locs] = 0
         spatial_locs_ss[:, 1][invalid_spatial_locs] = 0
-        invalid_writes_f = rearrange(invalid_writes, 'b h w -> b () h w').bool()
-        img[invalid_writes_f] = 0
+        # invalid_writes_f = rearrange(invalid_writes, 'b h w -> b () h w').bool()
+        invalid_writes_f = rearrange(invalid_writes, 'b h w -> b () h w').float()
+        img_masked = img * (1 - invalid_writes_f) + eps * invalid_writes_f
         
         # Linearize ground-plane indices (linear idx = y * W + x)
         linear_locs_ss = spatial_locs_ss[:, 1] * outw + spatial_locs_ss[:, 0] # (bs, H, W)
         linear_locs_ss = rearrange(linear_locs_ss, 'b h w -> b () (h w)')
         linear_locs_ss = linear_locs_ss.expand(-1, f, -1) # .contiguous()
-        img_target = rearrange(img, 'b e h w -> b e (h w)')
+        img_target = rearrange(img_masked, 'b e h w -> b e (h w)')
         
-        proj_feats = torch_scatter.scatter_mean( # change to scatter_min
+        proj_feats, _ = torch_scatter.scatter_min(
             img_target,
             linear_locs_ss,
             dim=2,
             dim_size=outh*outw
         )
         proj_feats = rearrange(proj_feats, 'b e (h w) -> b e h w', h=outh)
-        # eps_mask = (proj_feats == eps).float()
-        # proj_feats = proj_feats * (1 - eps_mask) + eps_mask * (proj_feats - eps)
+        eps_mask = (proj_feats == eps).float()
+        proj_feats = proj_feats * (1 - eps_mask) + eps_mask * (proj_feats - eps)
         # Valid inputs
         occupied_area = (proj_feats != 0) & ((proj_feats > self.height_min) & (proj_feats < self.height_max))
         vaccant_area = (proj_feats != 0) & (proj_feats < self.height_min)
@@ -189,8 +193,9 @@ class ProjectToGroundPlane():
         return belief_map
     
 class ProjectSemanticToGroundPlane():
-    def __init__(self, egocentric_map_size, device):
+    def __init__(self, egocentric_map_size, num_classes, device):
         self.egocentric_map_size = egocentric_map_size
+        self.num_classes = num_classes
         self.device = device
 
     def forward(self, img, spatial_locs, valid_map):
@@ -239,7 +244,7 @@ class ProjectSemanticToGroundPlane():
         proj_feats = rearrange(proj_feats.contiguous(), 'b e (h w) -> b e h w', h=outh)
         proj_feats[:, 0, ...] = 0
         proj_feats = torch.argmax(proj_feats, dim=1) # B X H X W
-        proj_feats = F.one_hot(proj_feats.long(), num_classes=23).long().permute(0, 3, 1, 2)
+        proj_feats = F.one_hot(proj_feats.long(), num_classes=self.num_classes).long().permute(0, 3, 1, 2)
         return proj_feats # B X C X H X W
 
 class OccupancyProjection:
@@ -266,14 +271,14 @@ class OccupancyProjection:
 class SemanticObsProjection:
     def __init__(self, 
             egocentric_map_size, global_map_size, device, 
-            coordinate_min, coordinate_max, height_min, height_max
+            coordinate_min, coordinate_max, height_min, height_max, num_classes
         ):
         self.egocentric_map_size = egocentric_map_size
         self.global_map_size = global_map_size
         self.compute_spatial_locs = ComputePointCloud(egocentric_map_size, global_map_size, 
             device, coordinate_min, coordinate_max, height_min, height_max
         )
-        self.project_to_ground_plane = ProjectSemanticToGroundPlane(egocentric_map_size, device)
+        self.project_to_ground_plane = ProjectSemanticToGroundPlane(egocentric_map_size, num_classes, device)
 
     def forward(self, semantic, depth) -> torch.Tensor:
         spatial_locs, _, valid_maps = self.compute_spatial_locs.forward(depth)
@@ -335,8 +340,8 @@ class Registration():
 
         st_pose = torch.cat(
             [
-                -(grid_y.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), # 
-                -(grid_x.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), # 
+                -(grid_y.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), 
+                -(grid_x.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), 
                 observations['compass']
             ], 
             dim=1
@@ -372,8 +377,8 @@ class Registration():
 
         st_pose = torch.cat(
             [
-                -(grid_y.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), # - (self.global_map_size//2)
-                -(grid_x.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), # - (self.global_map_size//2)
+                -(grid_y.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), 
+                -(grid_x.unsqueeze(1) - (self.global_map_size//2))/(self.global_map_size//2), 
                 observations['compass']
             ], 
             dim=1
@@ -392,7 +397,7 @@ class Registration():
 class SemanticMap():
     def __init__(self,
             global_map_size, egocentric_map_size, num_process, num_classes,
-            device, coordinate_min, coordinate_max, height_min=-0.7, height_max=1.2
+            device, coordinate_min, coordinate_max, height_min=-0.7, height_max=0.8
         ):
         self.num_process = num_process
         self.global_map_size = global_map_size
@@ -407,7 +412,7 @@ class SemanticMap():
         self.device = device
         self.projection_sem = SemanticObsProjection(
             self.egocentric_map_size, self.global_map_size, device, 
-            coordinate_min, coordinate_max, height_min, height_max
+            coordinate_min, coordinate_max, height_min, height_max, num_classes
         )
         self.registration = Registration(
             self.egocentric_map_size, self.global_map_size, coordinate_min, coordinate_max, 
@@ -431,13 +436,13 @@ class SemanticMap():
     
     def get_current_global_maps(self) -> torch.Tensor:
         gasm = torch.argmax(self.global_allocentric_semantic_map, dim=-1)
-        gasm = F.one_hot(gasm.long(), num_classes=23).long()
+        gasm = F.one_hot(gasm.long(), num_classes=self.num_classes).long()
         return gasm
     
     def update_map(self, observations: Dict[str, torch.Tensor]):
         depth = observations['depth']
         semantic = observations['semantic']
-        sem_gt_torch = F.one_hot(semantic.long(), num_classes=23).long().permute(0, 3, 1, 2)
+        sem_gt_torch = F.one_hot(semantic.long(), num_classes=self.num_classes).long().permute(0, 3, 1, 2)
         projection_res_sem = self.projection_sem.forward(sem_gt_torch, depth * 10.)
         self.global_allocentric_semantic_map = \
                 self.registration.forward_seg(observations, self.global_allocentric_semantic_map, projection_res_sem)
@@ -449,7 +454,7 @@ class OccupancyMap():
     def __init__(self, 
             global_map_size, egocentric_map_size, num_process,
             device, coordinate_min, coordinate_max, vaccant_bel, occupied_bel, 
-            height_min=-0.7, height_max=0.8
+            height_min=-0.8, height_max=1.5
         ):
         self.num_process = num_process
         self.global_map_size = global_map_size

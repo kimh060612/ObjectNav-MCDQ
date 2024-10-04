@@ -10,7 +10,7 @@ VIDEO_DIR: "data_ssd/video_dir"
 TEST_EPISODE_COUNT: 2184
 EVAL_CKPT_PATH_DIR: "model_checkpoints"
 NUM_PROCESSES: 16
-SENSORS: ["DEPTH_SENSOR", "RGB_SENSOR"]
+SENSORS: ["DEPTH_SENSOR", "RGB_SENSOR", 'SEMANTIC_SENSOR']
 CHECKPOINT_FOLDER: "cpt"
 NUM_UPDATES: 10000
 LOG_INTERVAL: 10
@@ -23,7 +23,7 @@ RL:
     # ppo params
     clip_param: 0.2
     ppo_epoch: 2
-    num_mini_batch: 6
+    num_mini_batch: 4
     weight_decay: 1.0e-3
     value_loss_coef: 0.5
     entropy_coef: 1.0e-4
@@ -44,16 +44,17 @@ RL:
     use_normalized_advantage: False
     hidden_size: 512
     num_mc_drop: 4 # number of MC-Dropout model 
-    mc_drop_rate: 0.5
-    num_classes: 23
-    confidence_rate: 1.2
+    mc_drop_rate: 0.4
+    num_classes: 22
+    confidence_rate: 1.0
     semantic_pretrain: './segmentation_ckp/mobilenet_habitat_best_model.pth'
   MAPS:
-    egocentric_map_size: 100 # 10m depth range for 
-    global_map_size: 400 # 40m range global map coverage
+    egocentric_map_size: 50 # 10m depth range for 0.2m/grid size
+    global_map_size: 200 # 40m range global map coverage for 0.2m/grid size
     coordinate_min: -20.0
     coordinate_max:  20.0
-    vacant_belief: -450
+    vacant_belief: -100
     occupied_belief: 100
-    entropy_coef: 5.0e-2
+    entropy_coef: 1.0
+    map_save_debug: 'data_ssd/' # data_ssd/ 
 

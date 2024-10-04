@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+import torch.cuda
 import torch.nn as nn
 import torch.optim
 import tqdm
@@ -32,6 +33,8 @@ from habitat_baselines.common.utils import (
 from habitat_baselines.rl.ppo import PPO, PointNavBaselinePolicy, ObjectNavUncertainQAgent
 from habitat_baselines.rl.models.geometry import OccupancyMap, SemanticMap, to_grid, crop_global_map
 from habitat_baselines.rl.models.mobilenet import get_mobilenet_v3_small_seg
+from h5py import File as fs
+from typing import Dict
 
 @baseline_registry.register_trainer(name="ppo")
 class PPOTrainer(BaseRLTrainer):
@@ -663,6 +666,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
         """
         logger.add_filehandler(self.config.LOG_FILE)
         
+        ### Debugging: env.py를 확인하면서 조사
         self.occ_map_generator = OccupancyMap(
             map_cfg.global_map_size, map_cfg.egocentric_map_size,
             num_process, device,
@@ -677,7 +681,11 @@ class QNetUncertainTrainer(BaseRLTrainer):
         )
         self.grid_transform = to_grid(map_cfg.global_map_size, map_cfg.coordinate_min, map_cfg.coordinate_max)
         
-        self.semantic_encoder = get_mobilenet_v3_small_seg(dqn_cfg.num_classes, dqn_cfg.semantic_pretrain, True).to(self.device)
+        ### Segmentation을 위하여 이미지 크기를 조정하는 것도 방법이라고 생각함.
+        ### labeling이 얼마나 성능에 큰 파이를 차지하는지 조사
+        ### Seraph로 Segmentation을 이전한 뒤에 우선 semantic GT를 사용하여 진행해봄.
+        ### 나중에 이 라인의 주석을 풀고 segmentation module을 삽입해야함.
+        # self.semantic_encoder = get_mobilenet_v3_small_seg(dqn_cfg.num_classes, dqn_cfg.semantic_pretrain, True).to(self.device)
         self.q_agent = ObjectNavUncertainQAgent(
             goal_sensor_uuid=self.config.TASK_CONFIG.TASK.GOAL_SENSOR_UUID,
             num_local_steps=dqn_cfg.num_local_steps,
@@ -686,7 +694,8 @@ class QNetUncertainTrainer(BaseRLTrainer):
             device=device,
             num_classes=dqn_cfg.num_classes,
             action_space=self.envs.action_spaces[0],
-            confidence=dqn_cfg.confidence_rate
+            confidence=dqn_cfg.confidence_rate,
+            local_map_size=map_cfg.egocentric_map_size
         )
         self.q_agent.to(self.device)
         self.loss_fn = nn.SmoothL1Loss().to(self.device)
@@ -773,13 +782,23 @@ class QNetUncertainTrainer(BaseRLTrainer):
         return results
 
     def _unpack_batch(self, batch, map_cfg):
+        ### 1번 문제: Segmentation이 그지같은 성능을 보임
+        ### 2번 문제: 또 또 Projection Module이 잘못됨
         batch['rgb'] = batch['rgb'].permute(0, 3, 1, 2)
-        sem_img = self.semantic_encoder(batch['rgb'].to(self.device))
-        batch['semantic'] = torch.argmax(sem_img[0], dim=1)
+        ### 우선 Feasiblity를 보기 위하여 ground truth semantic image를 사용해 보는 것도 방법이라고 생각함.
+        ### habitat/core/env.py의 reset/step method를 수정함: 나중에 이를 지우고 segmentation module로써 진행함.
+        # sem_img = self.semantic_encoder(batch['rgb'].to(self.device))
+        # batch['semantic'] = torch.argmax(sem_img[0], dim=1)
         self.occ_map_generator.update_map(batch)
         self.sem_map_generator.update_map(batch)
         global_allocentric_map = self.occ_map_generator.get_current_global_maps()
         global_semantic_map = self.sem_map_generator.get_current_global_maps()
+        
+        # if not map_cfg.map_save_debug == '':
+        #     with fs(f"{map_cfg.map_save_debug}/gdata_{len(self.replay_buf)}.h5", 'w') as f:
+        #         f.create_dataset('occ_map', data=global_allocentric_map.cpu().numpy(), dtype=np.float32)
+        #         f.create_dataset('sem_map', data=global_semantic_map.cpu().numpy(), dtype=np.float32)
+        #         f.create_dataset('semantic', data=batch['semantic'].cpu().numpy(), dtype=np.float32)
         
         ### Cropping the map to egocentric
         local_occ_map = crop_global_map(
@@ -799,8 +818,14 @@ class QNetUncertainTrainer(BaseRLTrainer):
         entropy = -torch.sum(x * torch.log(x), dim=(1, 2, 3))
         return entropy
     
-    def _get_gain_reward(self, m_curr, m_next):
-        return self._entropy(m_curr) - self._entropy(m_next)
+    def _get_coverage(self, x: torch.Tensor):
+        mask_occ = x > 0.7
+        mask_free = x < 0.3
+        mask = (mask_occ + mask_free).long()
+        return torch.sum(mask, dim=(1, 2, 3)) # B X 1
+    
+    def _get_gain_reward(self, m_curr, m_next, map_size):
+        return (self._get_coverage(m_next) - self._get_coverage(m_curr)) / (map_size * map_size)
 
     def _one_step_forward(self, 
         obs_curr, occ_map_curr, sem_map_curr, 
@@ -823,23 +848,25 @@ class QNetUncertainTrainer(BaseRLTrainer):
         t_update_stats = time.time()
         batch = batch_obs(observations, device=self.device)
         batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
+        for idx, done in enumerate(dones):
+            if done:
+                self.occ_map_generator.reset_index(idx)
+                self.sem_map_generator.reset_index(idx)
+                
+        occ_reward = self._get_gain_reward(
+            occ_map_curr, local_occ_map, map_cfg.egocentric_map_size
+        ).unsqueeze(1).to(current_episode_reward.device)
         
-        occ_reward = self._get_gain_reward(occ_map_curr, local_occ_map).unsqueeze(1).to(torch.device('cpu'))
         rewards = torch.tensor(
             rewards, dtype=torch.float, device=current_episode_reward.device
         )
         rewards = rewards.unsqueeze(1) + map_cfg.entropy_coef * occ_reward
-
+        
         masks = torch.tensor(
             [[0.0] if done else [1.0] for done in dones],
             dtype=torch.float,
             device=current_episode_reward.device,
         ) # done: 0.0 == Done, 1.0 == Not Done
-        
-        for idx, done in enumerate(dones):
-            if done:
-                self.occ_map_generator.reset_index(idx)
-                self.sem_map_generator.reset_index(idx)
         
         current_episode_reward += rewards
         running_episode_stats["reward"] += (1 - masks) * current_episode_reward
@@ -863,7 +890,10 @@ class QNetUncertainTrainer(BaseRLTrainer):
         )
         
         pth_time += time.time() - t_update_stats
-        return batch, local_occ_map, local_semantic_map, pth_time, env_time, self.envs.num_envs
+        return (
+            batch, local_occ_map, local_semantic_map, 
+            pth_time, env_time, self.envs.num_envs, dones
+        )
 
     def _before_step(self):
         nn.utils.clip_grad_norm_(
@@ -886,8 +916,8 @@ class QNetUncertainTrainer(BaseRLTrainer):
 
         q_main_pred, q_main_pred_var = self.q_agent.get_q_main(obs_curr, occ_curr, sem_curr, action_curr)
         q_max_target = self.q_agent.get_target(obs_next, occ_next, sem_next)
-        target = reward_curr + ppo_cfg.discount * mask * q_max_target
-        loss = self.loss_fn(q_main_pred, target)
+        target = reward_curr + ppo_cfg.discount * q_max_target
+        loss = self.loss_fn(q_main_pred * mask, target * mask)
         loss.backward()
         self._before_step()
         self.optimizer.step()
@@ -898,6 +928,10 @@ class QNetUncertainTrainer(BaseRLTrainer):
             loss,
             torch.mean(q_main_pred_var, dim=0)
         )
+
+    def _copy_batch(self, batch_obs: Dict[str, torch.Tensor]):
+        new_obs = { k: v.clone().detach() for k, v in batch_obs.items() }
+        return new_obs
 
     def train(self) -> None:
         self.envs = construct_envs(
@@ -911,6 +945,10 @@ class QNetUncertainTrainer(BaseRLTrainer):
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
+        import random
+        torch.manual_seed(987654321)
+        torch.cuda.manual_seed(987654321)
+        random.seed(987654321)
         if not os.path.isdir(self.config.CHECKPOINT_FOLDER):
             os.makedirs(self.config.CHECKPOINT_FOLDER)
         self._setup_dqn_agent(dqn_cfg, map_cfg, self.device, self.config.NUM_PROCESSES)
@@ -920,11 +958,15 @@ class QNetUncertainTrainer(BaseRLTrainer):
                 sum(param.numel() for param in self.q_agent.parameters())
             )
         )
-
+        
         observations = self.envs.reset()
         batch = batch_obs(observations, device=self.device)
         batch, local_occ_map, local_semantic_map = self._unpack_batch(batch, map_cfg)
-
+        
+        batch_curr = self._copy_batch(batch)
+        local_occ_map_curr = local_occ_map.clone().detach()
+        local_sem_map_curr = local_semantic_map.clone().detach()
+        
         current_episode_reward = torch.zeros(self.envs.num_envs, 1)
         running_episode_stats = dict(
             count=torch.zeros(self.envs.num_envs, 1),
@@ -944,32 +986,50 @@ class QNetUncertainTrainer(BaseRLTrainer):
             optimizer=self.optimizer,
             lr_lambda=lambda x: linear_decay(x, self.config.NUM_UPDATES),
         )
-
+        
         with TensorboardWriter(
             self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
         ) as writer:
-            for update in range(1, self.config.NUM_UPDATES + 1):
+            for update in range(self.config.NUM_UPDATES):
                 if dqn_cfg.use_linear_lr_decay:
                     lr_scheduler.step()
 
                 q_loss = 0
                 action_uncertainty = 0
                 
-                for n_s in range(dqn_cfg.num_steps // dqn_cfg.num_local_steps):
+                num_epsiode_iter = dqn_cfg.num_steps // dqn_cfg.num_local_steps
+                for n_s in range(num_epsiode_iter):
                     
-                    for _ in range(dqn_cfg.num_local_steps):
+                    for _t in range(dqn_cfg.num_local_steps):
                         
                         (
-                            batch,
-                            local_occ_map,
-                            local_semantic_map,
+                            batch_next,
+                            local_occ_map_next,
+                            local_semantic_map_next,
                             delta_pth_time,
                             delta_env_time,
                             delta_steps,
+                            dones
                         ) = self._one_step_forward(
-                            batch, local_occ_map, local_semantic_map, 
+                            batch_curr, local_occ_map_curr, local_sem_map_curr, 
                             current_episode_reward, running_episode_stats, map_cfg
                         )
+                        global_allocentric_map = self.occ_map_generator.get_current_global_maps()
+                        global_semantic_map = self.sem_map_generator.get_current_global_maps()
+                        if not map_cfg.map_save_debug == '':
+                            with fs(f"{map_cfg.map_save_debug}/gdata_update{update}_{n_s * num_epsiode_iter + _t}.h5", 'w') as f:
+                                f.create_dataset('occ_map', data=global_allocentric_map.cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('sem_map', data=global_semantic_map.cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('semantic', data=batch_curr['semantic'].cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('rgb', data=batch_curr['rgb'].cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('gps', data=batch_curr['gps'].cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('compass', data=batch_curr['compass'].cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('depth', data=batch_curr['depth'].cpu().numpy(), dtype=np.float32)
+                                f.create_dataset('dones', data=np.array(dones), dtype=np.bool)
+                        batch_curr = self._copy_batch(batch_next)
+                        local_occ_map_curr = local_occ_map_next.clone().detach()
+                        local_sem_map_curr = local_semantic_map_next.clone().detach()
+                        
                         pth_time += delta_pth_time
                         env_time += delta_env_time
                         count_steps += delta_steps
@@ -988,8 +1048,8 @@ class QNetUncertainTrainer(BaseRLTrainer):
 
                     if len(self.replay_buf) >= dqn_cfg.replay_buffer_size:
                         self.replay_buf.reset()
-                    self.occ_map_generator.reset()
-                    self.sem_map_generator.reset()
+                    # self.occ_map_generator.reset()
+                    # self.sem_map_generator.reset()
                     
                     for k, v in running_episode_stats.items():
                         window_episode_stats[k].append(v.clone())
@@ -1029,17 +1089,18 @@ class QNetUncertainTrainer(BaseRLTrainer):
                     )
 
                     # log stats
-                    if ((update + 1) * (n_s + 1)) % self.config.LOG_INTERVAL == 0:
+                    num_updates = num_epsiode_iter * update + n_s
+                    if num_updates % self.config.LOG_INTERVAL == 0:
                         logger.info(
                             "update: {}\tfps: {:.3f}\t".format(
-                                update, count_steps / (time.time() - t_start)
+                                num_updates, count_steps / (time.time() - t_start)
                             )
                         )
 
                         logger.info(
                             "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
                             "frames: {}".format(
-                                update, env_time, pth_time, count_steps
+                                num_updates, env_time, pth_time, count_steps
                             )
                         )
                         
@@ -1055,7 +1116,7 @@ class QNetUncertainTrainer(BaseRLTrainer):
                         )
                         
                     # checkpoint model
-                    if (update * (n_s + 1)) % self.config.CHECKPOINT_INTERVAL == 0:
+                    if num_updates % self.config.CHECKPOINT_INTERVAL == 0:
                         self.save_checkpoint(
                             f"ckpt.{count_checkpoints}.pth", dict(step=count_steps)
                         )

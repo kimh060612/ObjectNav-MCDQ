@@ -78,10 +78,12 @@ class QNet(nn.Module):
         self.drop_4 = nn.Dropout(p=self.drop_rate) # MC Dropout 
 
         self.conv2 = nn.Conv2d(512, 128, kernel_size=1, stride=1)
-        self.drop_5 = nn.Dropout(p=self.drop_rate) # MC Dropout 
+        # self.conv3 = nn.Conv2d(128, 32, kernel_size=1, stride=1)
+        # self.conv4 = nn.Conv2d(32, 1, kernel_size=1, stride=1)
+        # self.drop_5 = nn.Dropout(p=self.drop_rate) # MC Dropout 
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(128, num_actions)
+        self.fc = nn.Linear(128 + 72, num_actions)
         self.drop_f = nn.Dropout(p=self.drop_rate) # MC Dropout 
         
         if not is_target:
@@ -110,7 +112,7 @@ class QNet(nn.Module):
             layers.append(block(self.inplanes, planes))
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, g_e):
         ### TODO: Need to implement more complex Q-Net
         '''
         obs = x[:, :self.num_channel,...]
@@ -138,12 +140,19 @@ class QNet(nn.Module):
         x = self.drop_4(x)
 
         x = self.conv2(x)
-        x = self.drop_5(x)
         x = self.relu(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
+        x = torch.cat([ x.squeeze(-1), g_e ], dim = 1)
         x = self.fc(x)
         x = self.drop_f(x)
+        # x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        # x = self.conv3(x)
+        # x = self.relu(x)
+        # x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        # x = self.conv4(x)
+        # x = self.drop_5(x)
+        
         return x
 
 

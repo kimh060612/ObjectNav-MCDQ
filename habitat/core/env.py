@@ -115,6 +115,50 @@ class Env:
         self._elapsed_steps = 0
         self._episode_start_time: Optional[float] = None
         self._episode_over = False
+        self.mp_obj_cat = { # 0번이 void
+            'void': 0, 
+            'chair': 3,
+            'table': 5,
+            'picture': 6,
+            'cabinet': 7,
+            'cushion': 8,
+            'sofa': 10,
+            'bed': 11,
+            'chest_of_drawers': 13,
+            'plant': 14,
+            'sink': 15,
+            'toilet': 18,
+            'stool': 19,
+            'towel': 20,
+            'tv_monitor': 22,
+            'shower': 23,
+            'bathtub': 25,
+            'counter': 26,
+            'fireplace': 27,
+            'gym_equipment': 33,
+            'seating': 34,
+            'clothes': 38
+        }
+        # self.labels_to_objectnav = {  v: i for i, (_, v) in enumerate(self.mp_objnav_cat.items()) }
+        self.object_whitelist = [ k for k, _ in self.mp_obj_cat.items() ]
+        self.semantic_annotations = self._sim.semantic_annotations()
+        self.all_objects = {int(o.id.split('_')[-1]): o for o in self.semantic_annotations.objects if o is not None}
+
+    def render_semantic_objnav(self, buf):
+        out = np.zeros(buf.shape, dtype=np.uint8) # class 0 -> void
+        object_ids = np.unique(buf)
+        for oid in object_ids:
+            if not oid in self.all_objects:
+                out[buf==oid] = 41
+            else:
+                object = self.all_objects[oid]
+                object_name = object.category.name(mapping='mpcat40')
+                if object_name in self.object_whitelist:
+                    object_index = self.object_whitelist.index(object_name)
+                    out[buf==oid] = object_index
+                else:
+                    out[buf==oid] = 0
+        return out
 
     @property
     def current_episode(self) -> Type[Episode]:
@@ -201,6 +245,7 @@ class Env:
         self.reconfigure(self._config)
 
         observations = self.task.reset(episode=self.current_episode)
+        observations['semantic'] = self.render_semantic_objnav(observations['semantic'])
         self._task.measurements.reset_measures(
             episode=self.current_episode, task=self.task
         )
@@ -244,6 +289,7 @@ class Env:
         observations = self.task.step(
             action=action, episode=self.current_episode
         )
+        observations['semantic'] = self.render_semantic_objnav(observations['semantic'])
 
         self._task.measurements.update_measures(
             episode=self.current_episode, action=action, task=self.task

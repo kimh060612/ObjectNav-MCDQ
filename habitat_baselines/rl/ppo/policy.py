@@ -73,26 +73,66 @@ class Policy(nn.Module):
         return value, action_log_probs, distribution_entropy, rnn_hidden_states
 
 class QAgent(nn.Module):
-    def __init__(self, main_q, target_q, dim_actions, confidence):
+    def __init__(self, main_q, target_q, dim_actions, confidence, local_map_size):
         super(QAgent, self).__init__()
         self.q_net = main_q
         self.target = target_q
         self.dim_actions = dim_actions
         self.confidence = confidence
+        self.w_occ = local_map_size
+        self.h_occ = local_map_size
     
     ## 이미 confidence로 uncertainty를 고려한 exploration 조절이 가능함. Epsilion 필요 노
     ## We can already manage the trade-off between exploration and exploitation. There is no need for eps-greedy
+    ## Action Sequence를 구성하는 방법 vs Point Goal Navigation w. DQN
+    ### 우선 action sequence 구성이 먼저 진행
+    ### Map anticipation은 나중에
     def _get_actions(self, q_map_mean, q_map_var):
         ucb_policy = q_map_mean + self.confidence * q_map_var # B X num_act
         # TODO: Does UCB is enough? Try Lower Confidence Bound & Other Methods
         ## Thompson Sampling can be the candidates
+        # b, _ = ucb_policy.shape
+        # import random
+        # sample = random.random()
         action = torch.argmax(ucb_policy, dim=1)
         return action # B X 1
     
+    def _get_map_point(self, q_map_mean, q_map_var):
+        ucb_policy = q_map_mean + self.confidence * q_map_var
+        tmp = torch.argmax(ucb_policy.view(1, -1)) # B X 1
+        a_w = tmp - ((tmp / self.w_occ).long() * self.w_occ)
+        a_h = ((tmp - a_w) / self.w_occ).long()
+        map_point = torch.cat( [ a_h, a_w ], dim = 1)
+        return map_point # B X 2
+    
+    def _get_action(self, map_point):
+        bsz, _ = map_point.shape
+        source = torch.Tensor([self.h_occ // 2, self.w_occ // 2]).unsqueeze(0).repeat(bsz, 1)
+        
+        action_list = []
+        angle = torch.zeros((bsz, 1))
+        if map_point[:, 1] > source[:, 1]:
+            if map_point[:, 0] < source[:, 0]:
+                angle = torch.arctan((map_point[:, 1] - source[:, 1]) / (source[:, 0] - map_point[:, 0]))
+            else:
+                angle = torch.arctan((map_point[:, 0] - source[:, 0]) / (map_point[:, 1] - source[:, 1]))
+                angle += torch.pi / 2.
+        elif map_point[0] < source[0]:
+            angle = torch.arctan((source[:, 1] - map_point[:, 1]) / (source[:, 0] - map_point[:, 0]))
+            angle = -angle
+        else:
+            angle = torch.arctan((map_point[:, 0] - source[:, 0]) / (source[:, 1] - map_point[:, 1]))
+            angle = -np.pi/2 - angle
+        action_list.append(-angle)
+        action_list.append("MOVE_FORWARD")
+        return action_list
+    
     def act(self, observations, global_allocentric_map, global_semantic_map):
         q_map_mean, q_map_var = self.q_net(observations, global_allocentric_map, global_semantic_map)
-        return self._get_actions(q_map_mean, q_map_var)
-    
+        actions = self._get_actions(q_map_mean, q_map_var)
+        return actions # only use stop action when agent gets close to the goal
+        # , torch.gather(q_map_mean, 1, actions - 1)
+        
     def get_q_main(self, observations, global_allocentric_map, global_semantic_map, actions):
         q_map_mean, q_map_var = self.q_net(observations, global_allocentric_map, global_semantic_map)
         actions = actions.unsqueeze(1)
@@ -144,6 +184,7 @@ class ObjectNavUncertainQAgent(QAgent):
             mc_drop_rate,
             device,
             num_classes,
+            local_map_size,
             # global_map_size,
             # coord_min, coord_max,
             action_space, confidence
@@ -168,7 +209,7 @@ class ObjectNavUncertainQAgent(QAgent):
                 num_classes,
                 action_space.n,
                 True
-            ), action_space.n, confidence
+            ), action_space.n, confidence, local_map_size
         )
 
 
@@ -269,7 +310,8 @@ class UncertainGoalQNet(nn.Module):
         
         self.goal_sensor_uuid = goal_sensor_uuid
         self.device = device
-        self.Q_net = QNet(num_classes, True, dim_actions, True, self.mc_drop_rate, is_target)
+        self.Q_net = QNet(num_classes, True, dim_actions, False, self.mc_drop_rate, is_target)
+        self.goal_embedding = nn.Embedding(21, 72)
         # self.transform_pos_grid = to_grid(global_map_size, coord_min, coord_max)
 
         ## (TODO): Things to consider
@@ -295,31 +337,48 @@ class UncertainGoalQNet(nn.Module):
     def get_target_encoding(self, observations):
         return observations[self.goal_sensor_uuid]
 
-    def forward(self, observations, global_allocentric_map, global_semantic_map):
-        target_obj_id = self.get_target_encoding(observations).long()
+    # def count_ones_in_circle(self, img, radius):
+    #     B, H, W, _ = img.shape
+    #     y_center, x_center = H // 2, W // 2
+
+    #     # 각 좌표의 (y, x) 인덱스 생성
+    #     # print(B, H, W)
+    #     y_indices = torch.arange(0, H).unsqueeze(1).float().to(self.device)
+    #     x_indices = torch.arange(0, W).unsqueeze(0).float().to(self.device)
+
+    #     # 중심점에서 각 좌표까지의 거리 계산
+    #     distance_squared = (y_indices - y_center)**2 + (x_indices - x_center)**2
+    #     mask = distance_squared <= radius**2
+    #     mask = mask.float().unsqueeze(0).expand(B, -1, -1).unsqueeze(-1).to(self.device)
         
-        b, _, _, _ = global_semantic_map.shape
-        # print(global_semantic_map.shape)
-        # print(target_obj_id, observations[self.goal_sensor_uuid].shape)
-        # print(global_allocentric_map.shape)
-        global_goal_index = torch.zeros_like(global_allocentric_map).to(self.device)
-        global_semantic_index = torch.argmax(global_semantic_map, dim=-1).long()
-        # print(global_goal_index.shape)
-        global_goal_index[global_semantic_index == target_obj_id.view(b, 1, 1)] = 1.
-        global_map_final = torch.cat([
-            global_allocentric_map.permute(0, 3, 1, 2),
-            global_semantic_map.permute(0, 3, 1, 2),
-            global_goal_index.permute(0, 3, 1, 2)
+    #     count = torch.sum(img.float() * mask, dim=(1, 2, 3))
+    #     return count
+
+
+    def forward(self, observations, local_allocentric_map, local_semantic_map):
+        target_obj_id = self.get_target_encoding(observations).long()
+        goal_emb = self.goal_embedding(target_obj_id).squeeze(1)
+        # b, h, w, _ = local_semantic_map.shape
+        # target_label_map = target_obj_id.view(b, 1, 1).expand(-1, h, w).clone().detach()
+        # local_goal_index = torch.zeros_like(local_allocentric_map).to(self.device)
+        # local_semantic_index = torch.argmax(local_semantic_map, dim=-1).long()
+        # mask = (local_semantic_index == target_label_map).unsqueeze(-1)
+        # local_goal_index += mask.long()
+        local_map_final = torch.cat([
+            local_allocentric_map.permute(0, 3, 1, 2),
+            local_semantic_map.permute(0, 3, 1, 2),
+            # local_goal_index.permute(0, 3, 1, 2)
         ], dim=1).float()
         
         if not self.is_target:
+            # is_close = self.count_ones_in_circle(local_goal_index, radius=4.) < 3. # goal 근처가 아니면 1, goal 근처면 0
             q_map_list = []
             for _ in range(self.num_mc_drop):
-                q_map_list.append(self.Q_net(global_map_final))
+                q_map_list.append(self.Q_net(local_map_final, goal_emb))
             q_map_stack = torch.stack(q_map_list, dim=1)
             q_map_mean = torch.mean(q_map_stack, dim=1) # B x num_act
             q_map_var = torch.var(q_map_stack, dim=1) # B x num_act
             
             return q_map_mean, q_map_var
         else:
-            return self.Q_net(global_map_final)
+            return self.Q_net(local_map_final, goal_emb)
